@@ -2,6 +2,7 @@ const RPC = require('../lib/rpc');
 const {Tx} = require('../lib/structs');
 const TxHandler = require('./tx_handler');
 const Callback = require('./callback');
+const Base58 = require('bs58');
 
 const defaultConfig = {
     gasRatio: 1,
@@ -26,6 +27,7 @@ class IOST {
         Object.assign(this.config, config);
         this.rpc = undefined;
         this.account = undefined;
+        this.serverTimeDiff = 0;
     }
 
     /**
@@ -38,8 +40,6 @@ class IOST {
     callABI(contract, abi, args) {
         const t = new Tx(this.config.gasRatio, this.config.gasLimit);
         t.addAction(contract, abi, JSON.stringify(args));
-        t.setTime(this.config.expiration, this.config.delay);
-        t.addApprove("*", this.config.defaultLimit);
         return t
     }
 
@@ -54,7 +54,6 @@ class IOST {
      */
     transfer(token, from, to, amount, memo = "") {
         let t = this.callABI("token.iost", "transfer", [token, from, to, amount, memo]);
-        t.addApprove("*", this.config.defaultLimit);
         t.addApprove("iost", amount);
         return t;
     }
@@ -70,6 +69,9 @@ class IOST {
      * @returns {Tx}
      */
     newAccount(name, creator, ownerkey, activekey, initialRAM, initialGasPledge) {
+        if (!this._checkPublicKey(ownerkey) || !this._checkPublicKey(activekey))
+            throw "error public key";
+
         const t = new Tx(this.config.gasRatio, this.config.gasLimit);
         t.addAction("auth.iost", "signUp", JSON.stringify([name, ownerkey, activekey]));
         if (initialRAM > 10) {
@@ -78,9 +80,12 @@ class IOST {
         if (initialGasPledge > 0){
             t.addAction("gas.iost", "pledge", JSON.stringify([creator, name, initialGasPledge+""]));
         }
-        t.setTime(this.config.expiration, this.config.delay);
-        t.addApprove("*", this.config.defaultLimit);
         return t
+    }
+
+    _checkPublicKey(key) {
+        let b = Base58.decode(key);
+        return b.length === 32;
     }
 
     /**
@@ -89,42 +94,23 @@ class IOST {
      * @constructor
      */
     signAndSend(tx) {
-        let cb = new Callback();
+        tx.setTime(this.config.expiration, this.config.delay, this.serverTimeDiff);
+        let cb = new Callback(this.currentRPC.transaction);
         let hash = "";
-        this.currentAccount.signTx(tx);
-        this.currentRPC.transaction.sendTx(tx)
-            .then(function(data){
-                hash = data.hash;
-                cb.pushMsg("pending", hash)
-            })
-            .catch(function (e) {
-                cb.pushMsg("failed", e)
-            });
-
-        let status = "pending";
-        let i = 1;
         let self = this;
-        let id = setInterval(function () {
-            if (status === "success" || status === "failed" || i > 90) {
-                clearInterval(id);
-                if (status !== "success" && status !== "failed" && i > 90) {
-                    cb.pushMsg("failed", "Error: tx " + hash + " on chain timeout.");
-                }
-                return
-            }
-            i++;
-            self.currentRPC.transaction.getTxReceiptByTxHash(hash).then(function (res) {
-                if (res.status_code === "SUCCESS" && status === "pending") {
-                    cb.pushMsg("success", res);
-                    status = "success"
-                } else if (res.status_code !== undefined && status === "pending") {
-                    cb.pushMsg("failed", res);
-                    status = "failed"
-                }
-            }).catch(function (e) {
-            })
 
-        }, 1000);
+        self.currentAccount.signTx(tx);
+        setTimeout(function () {
+            self.currentRPC.transaction.sendTx(tx)
+                .then(function(data){
+                    hash = data.hash;
+                    cb.pushMsg("pending", hash);
+                    cb.hash = hash
+                })
+                .catch(function (e) {
+                    cb.pushMsg("failed", e)
+                })
+        }, 50);
 
         return cb;
     }
@@ -147,8 +133,16 @@ class IOST {
      * set a RPC to this iost
      * @param {RPC}rpc - rpc created by hand
      */
-    setRPC(rpc) {
+    async setRPC(rpc) {
         this.currentRPC = rpc;
+        
+        const requestStartTime = new Date().getTime() * 1e6;
+        const nodeInfo = await this.currentRPC.net.getNodeInfo();
+        const requestEndTime = new Date().getTime() * 1e6;
+
+        if (requestEndTime - requestStartTime < 30 * 1e9) {
+            this.serverTimeDiff = nodeInfo.server_time - requestStartTime;
+        }
     };
 
     /**

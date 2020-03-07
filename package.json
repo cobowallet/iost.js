@@ -2,7 +2,7 @@
   "name": "iost",
   "version": "0.1.14",
   "description": "iost JavaScript SDK",
-  "main": "index.js",
+  "main": "dist/iost.main.js",
   "author": "IOST.IO",
   "scripts": {
     "build": "webpack --config webpack.config.js"
